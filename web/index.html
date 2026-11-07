@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tin-can-phone</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <h1>tin-can-phone</h1>
+  <p>Self-hosted audio calls in the browser. Calls are coming in a later version.</p>
+  {{- if .InstallURL}}
+  <p class="notice">Did your browser show a certificate warning?
+    <a href="{{.InstallURL}}">Install this server's certificate authority</a> on your device.</p>
+  {{- end}}
+</main>
+<footer>version {{.Version}}</footer>
+</body>
+</html>

@@ -32,3 +32,10 @@ go.work.sum
 .idea/
 .vscode/
 .DS_Store
+
+# Build output and local runtime data (selfca CA, ACME cache)
+bin/
+.data/
+
+# JetBrains per-user state (also covered by .idea/ above)
+.idea/workspace.xml

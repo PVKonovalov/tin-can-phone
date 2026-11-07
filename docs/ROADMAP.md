@@ -6,8 +6,8 @@ The prompt for the next step is written after the previous step is done.
 
 | Step | Content | Result (how to check) | Status |
 |---|---|---|---|
-| 1 | Skeleton: config, TLS modes `acme`/`files`/`selfca`, port-80 handlers, embedded static, `/healthz`, graceful shutdown | Placeholder page opens over HTTPS in `selfca` mode on LAN; tests green | prompt ready |
-| 2 | Rooms + WebSocket signaling: server-assigned peer IDs, envelope, TTL, `MAX_PEERS`, Origin check, rate limit, ping/pong | `httptest` tests with several WS clients: join/leave/notify/limits | — |
+| 1 | Skeleton: config, TLS modes `acme`/`files`/`selfca`, port-80 handlers, embedded static, `/healthz`, graceful shutdown | Placeholder page opens over HTTPS in `selfca` mode on LAN; tests green | done |
+| 2 | Rooms + WebSocket signaling: server-assigned peer IDs, envelope, TTL, `MAX_PEERS`, Origin check, rate limit, ping/pong | `httptest` tests with several WS clients: join/leave/notify/limits | prompt ready |
 | 3 | SFU, 1-on-1 audio: Pion, UDPMux on `MEDIA_PORT`, `ADVERTISE_IPS`; minimal UI (Create Call, Join Audio, Leave) | Playwright e2e: two Chromium instances with fake microphone receive each other's audio | — |
 | 4 | Multi-party: renegotiation on join/leave, mute, participant statuses, Copy Link | e2e with 4 participants; mute is visible to others | — |
 | 5 | Resilience: WS reconnect, ICE restart on network change, ICE-TCP fallback | e2e with UDP blocked still connects; reconnect after WS drop | — |
