@@ -26,15 +26,16 @@ const (
 	TypePeerJoined   = "peer-joined"   // S→C PeerInfo
 	TypePeerLeft     = "peer-left"     // S→C {peerId}
 	TypePeerState    = "peer-state"    // C→S {muted}; S→C {muted} with From = peer
-	TypeOffer        = "offer"         // C↔S, media
-	TypeAnswer       = "answer"        // C↔S, media
-	TypeICECandidate = "ice-candidate" // C↔S, media
+	TypeMediaJoin    = "media-join"    // C→S, empty payload: start sending/receiving audio
+	TypeOffer        = "offer"         // S→C, media (only the server offers)
+	TypeAnswer       = "answer"        // C→S, media
+	TypeICECandidate = "ice-candidate" // C↔S, media; null payload = end of candidates
 	TypeError        = "error"         // S→C {code, message}
 )
 
 // IsMedia reports whether t is routed to the MediaHandler.
 func IsMedia(t string) bool {
-	return t == TypeOffer || t == TypeAnswer || t == TypeICECandidate
+	return t == TypeMediaJoin || t == TypeOffer || t == TypeAnswer || t == TypeICECandidate
 }
 
 // Payloads.
@@ -66,7 +67,10 @@ type (
 
 // Error codes sent in TypeError payloads.
 const (
-	ErrMediaUnavailable = "media-unavailable"
+	ErrMediaUnavailable = "media-unavailable" // no media backend
+	ErrUnexpectedOffer  = "unexpected-offer"  // clients never send offers
+	ErrUnexpectedAnswer = "unexpected-answer" // answer without an outstanding offer
+	ErrMediaFailed      = "media-failed"      // connection failed; client may send media-join again
 )
 
 // WebSocket close codes.

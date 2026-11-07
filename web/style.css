@@ -52,3 +52,62 @@ footer {
   color: var(--muted);
   font-size: .85rem;
 }
+
+[hidden] {
+  display: none !important;
+}
+
+button {
+  font: inherit;
+  padding: .55rem 1.1rem;
+  margin: .25rem .5rem .25rem 0;
+  border: 0;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: .6;
+  cursor: default;
+}
+
+#leave {
+  background: #c62828;
+}
+
+input {
+  font: inherit;
+  padding: .45rem .6rem;
+  margin: .25rem .5rem .25rem 0;
+  border: 1px solid var(--muted);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  max-width: 100%;
+}
+
+label {
+  display: block;
+  margin-top: .5rem;
+}
+
+#participants {
+  padding-left: 1.25rem;
+}
+
+.status {
+  color: var(--muted);
+  font-size: .9rem;
+}
+
+.error {
+  color: #c62828;
+}
+
+@media (prefers-color-scheme: dark) {
+  .error {
+    color: #ff8a80;
+  }
+}

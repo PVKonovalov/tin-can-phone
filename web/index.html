@@ -5,11 +5,42 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tin-can-phone</title>
 <link rel="stylesheet" href="/style.css">
+<script type="module" src="/app.js"></script>
 </head>
 <body>
 <main>
   <h1>tin-can-phone</h1>
-  <p>Self-hosted audio calls in the browser. Calls are coming in a later version.</p>
+
+  <section id="home" hidden>
+    <p>Self-hosted audio calls in the browser.</p>
+    <button id="create" type="button">Create Call</button>
+    <p id="home-error" class="error" role="alert" hidden></p>
+  </section>
+
+  <section id="room" hidden>
+    <p id="room-info"></p>
+    <form id="join-form">
+      <label for="name">Your name</label>
+      <input id="name" name="name" maxlength="40" autocomplete="nickname" required>
+      <button id="join" type="submit">Join Audio</button>
+    </form>
+    <div id="in-call" hidden>
+      <h2>Participants</h2>
+      <ul id="participants"></ul>
+      <button id="leave" type="button">Leave</button>
+      <button id="enable-audio" type="button" hidden>Tap to enable audio</button>
+      <button id="retry" type="button" hidden>Reconnect audio</button>
+    </div>
+    <p id="status" class="status" aria-live="polite"></p>
+    <p id="error" class="error" role="alert" hidden></p>
+    <div id="audio" hidden></div>
+  </section>
+
+  <section id="notfound" hidden>
+    <p class="error">This call does not exist or has expired.</p>
+    <p><a href="/">Start a new call</a></p>
+  </section>
+
   {{- if .InstallURL}}
   <p class="notice">Did your browser show a certificate warning?
     <a href="{{.InstallURL}}">Install this server's certificate authority</a> on your device.</p>

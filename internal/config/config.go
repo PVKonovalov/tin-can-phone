@@ -35,6 +35,7 @@ const (
 	DefaultMaxPeers     = 8
 	DefaultMaxRooms     = 1000
 	DefaultRoomTTL      = 30 * time.Minute
+	DefaultMediaPort    = 50000
 
 	MinMaxPeers = 2
 	MaxMaxPeers = 32
@@ -74,6 +75,12 @@ type Config struct {
 	// AllowedOrigins is the WebSocket Origin allow-list (normalized
 	// scheme://host[:port]). Empty means "same host as the request".
 	AllowedOrigins []string
+
+	// media
+	MediaPort int // single UDP port for all WebRTC media
+	// AdvertiseIPs are announced as ICE host candidates. Empty means
+	// auto-detect (see sfu.DetectIPs).
+	AdvertiseIPs []string
 }
 
 // Load reads the configuration using getenv (normally os.Getenv) and validates
@@ -131,6 +138,8 @@ func Load(getenv func(string) string) (*Config, error) {
 		MaxPeers:        intVar("MAX_PEERS", DefaultMaxPeers),
 		MaxRooms:        intVar("MAX_ROOMS", DefaultMaxRooms),
 		RoomTTL:         durVar("ROOM_TTL", DefaultRoomTTL),
+		MediaPort:       intVar("MEDIA_PORT", DefaultMediaPort),
+		AdvertiseIPs:    splitListKeepCase(get("ADVERTISE_IPS")), // no silent de-duplication: duplicates are an error
 	}
 	var originErrs []error
 	c.AllowedOrigins, originErrs = parseOrigins(splitListKeepCase(get("ALLOWED_ORIGINS")))
@@ -182,6 +191,25 @@ func (c *Config) Validate() error {
 	}
 	if c.RoomTTL < time.Second {
 		add("%sROOM_TTL: must be at least 1s, got %s", Prefix, c.RoomTTL)
+	}
+	if c.MediaPort < 1 || c.MediaPort > 65535 {
+		add("%sMEDIA_PORT: %d out of range 1-65535", Prefix, c.MediaPort)
+	} else if p := strconv.Itoa(c.MediaPort); p == c.HTTPSPort() || p == c.HTTPPort() {
+		add("%sMEDIA_PORT: %d must differ from the HTTP(S) listen ports", Prefix, c.MediaPort)
+	}
+	seenIPs := map[string]string{}
+	for _, s := range c.AdvertiseIPs {
+		ip := net.ParseIP(s)
+		switch {
+		case ip == nil:
+			add("%sADVERTISE_IPS: %q is not an IP address", Prefix, s)
+		case ip.IsUnspecified() || ip.IsMulticast():
+			add("%sADVERTISE_IPS: %q is not a unicast address", Prefix, s)
+		case seenIPs[ip.String()] != "":
+			add("%sADVERTISE_IPS: %q duplicates %q", Prefix, s, seenIPs[ip.String()])
+		default:
+			seenIPs[ip.String()] = s
+		}
 	}
 
 	switch c.TLSMode {
@@ -265,6 +293,8 @@ func (c *Config) LogAttrs() []any {
 		slog.Int("max_rooms", c.MaxRooms),
 		slog.Duration("room_ttl", c.RoomTTL),
 		slog.Any("allowed_origins", c.AllowedOrigins),
+		slog.Int("media_port", c.MediaPort),
+		slog.Any("advertise_ips", c.AdvertiseIPs),
 	}
 	switch c.TLSMode {
 	case ModeFiles:

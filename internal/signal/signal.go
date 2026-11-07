@@ -405,7 +405,7 @@ func (c *conn) handle(env protocol.Envelope) (websocket.StatusCode, string) {
 		if err := c.s.opts.Rooms.SetMuted(c.roomID, peerID, *st.Muted); err != nil {
 			return protocol.CloseBadMessage, "not in room"
 		}
-	case protocol.TypeOffer, protocol.TypeAnswer, protocol.TypeICECandidate:
+	case protocol.TypeMediaJoin, protocol.TypeOffer, protocol.TypeAnswer, protocol.TypeICECandidate:
 		if env.To != "" && env.To != protocol.ToSFU {
 			return protocol.CloseBadMessage, `media messages must be addressed to "sfu"`
 		}

@@ -6,8 +6,9 @@ third-party fonts or analytics. Everything the client needs comes from your serv
 It works on the Internet (public IP + domain, Let's Encrypt) and in isolated
 LAN/VPN networks (the server runs its own CA).
 
-> Status: step 2 of the [roadmap](docs/ROADMAP.md). TLS modes, rooms and WebSocket
-> signaling are done; audio (the SFU) is not implemented yet.
+> Status: step 3 of the [roadmap](docs/ROADMAP.md). Two people can talk: TLS
+> modes, rooms, signaling, the SFU and a minimal UI are done. Mute, multi-party
+> UI, reconnection and PWA come next.
 
 ## Build
 
@@ -16,7 +17,13 @@ Requires Go 1.26+.
 ```sh
 make build   # -> bin/tincan
 make test    # go vet + go test -race
+make e2e     # Playwright: two Chromium browsers call each other (needs Node)
 ```
+
+`make e2e` downloads Playwright's Chromium on first use. Where Chrome cannot
+open capture devices at all (seen in a macOS sandbox, where even the fake
+device hangs), run `make e2e E2E_MIC=synthetic` to feed a WebAudio tone instead
+of the fake microphone; everything after capture is the same.
 
 ## Run locally (`selfca` mode)
 
@@ -40,7 +47,10 @@ open http://localhost:8080/install          # CA install instructions per OS
 
 To use it from a phone on the same network, open `http://<lan-ip>:8080/install`,
 install and trust the CA (check the SHA-256 fingerprint against the server log),
-then open `https://<lan-ip>:8443/`.
+then open `https://<lan-ip>:8443/`, press *Create Call* and open the room link
+on the other device. Media uses UDP port 50000 (`MEDIA_PORT`); the Makefile
+advertises the `en0` LAN IP and 127.0.0.1 (`ADVERTISE_IPS`). Allow incoming UDP
+on that port if the macOS firewall asks.
 
 ## Configuration
 
@@ -58,6 +68,8 @@ All settings are environment variables with the `TINCAN_` prefix:
 | `PUBLIC_HTTP_PORT` | `80` | external HTTP port for the `selfca` install link |
 | `MAX_PEERS`, `MAX_ROOMS`, `ROOM_TTL` | `8`, `1000`, `30m` | room limits |
 | `ALLOWED_ORIGINS` | origin of `PUBLIC_URL` | WebSocket Origin allow-list |
+| `MEDIA_PORT` | `50000` | UDP port for all WebRTC media |
+| `ADVERTISE_IPS` | auto (with warning) | IPs clients use to reach the media port |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design and
 [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next.

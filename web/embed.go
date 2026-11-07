@@ -5,5 +5,5 @@ import "embed"
 
 // FS contains the client files. index.html is an html/template.
 //
-//go:embed index.html style.css
+//go:embed index.html style.css app.js rtc.js
 var FS embed.FS

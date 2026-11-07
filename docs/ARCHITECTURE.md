@@ -35,7 +35,9 @@ in both modes (except `localhost` during development).
   not matter. The server only forwards RTP (no mixing, no transcoding).
 - **No TURN by default.** The server is always reachable (public IP or same
   network) and advertises its own addresses as ICE host candidates
-  (`ADVERTISE_IPS`, Pion NAT 1:1). UDP-blocked networks fall back to ICE-TCP.
+  (`ADVERTISE_IPS`, Pion address rewrite). Clients use no STUN/TURN at all
+  (`iceServers: []`); the server learns their addresses as peer-reflexive
+  candidates. UDP-blocked networks fall back to ICE-TCP (step 5).
   TURN over TLS on 443 is an optional last step for proxy-only networks.
 
 ## Ports
@@ -45,7 +47,7 @@ in both modes (except `localhost` during development).
 | 443/tcp | HTTPS, REST, WebSocket signaling |
 | 80/tcp | `acme`: HTTP-01 challenge + redirect; `selfca`: CA install page + redirect; `files`: redirect |
 | `MEDIA_PORT`/udp | all WebRTC media (UDPMux) |
-| `MEDIA_PORT`/tcp | ICE-TCP fallback |
+| `MEDIA_PORT`/tcp | ICE-TCP fallback (step 5) |
 
 ## Configuration (environment, prefix `TINCAN_`)
 
@@ -64,8 +66,8 @@ in both modes (except `localhost` during development).
 | `MAX_ROOMS` | `1000` | rooms in memory at once |
 | `ROOM_TTL` | `30m` | an empty room (including one never joined) is removed after this |
 | `ALLOWED_ORIGINS` | origin of `PUBLIC_URL` | WebSocket Origin allow-list, comma-separated; if neither is set, the Origin must be `https://` + the request `Host` |
-| `ADVERTISE_IPS` | | (step 3) IPs announced to clients as ICE candidates |
-| `MEDIA_PORT` | | (step 3) UDP/TCP media port |
+| `MEDIA_PORT` | `50000` | single UDP port for all media; must differ from the HTTP(S) ports |
+| `ADVERTISE_IPS` | auto | IPs announced as ICE host candidates, comma-separated, no duplicates. Unset → all non-loopback, non-link-local unicast host addresses, with a startup warning (set it explicitly) |
 
 Invalid configuration is reported all at once at startup; the effective
 configuration is logged (it contains no secrets).
@@ -142,8 +144,23 @@ Connection flow:
 | `peer-left` | S→C | `{peerId}` |
 | `peer-state` | C→S | `{muted: bool}` (required) |
 | `peer-state` | S→C | `{muted}` with `from` = that peer; sent to the others, not echoed |
-| `offer`, `answer`, `ice-candidate` | C↔S | passed to the media side; `to` must be `"sfu"` or empty (else `4400`) |
-| `error` | S→C | `{code, message}`; currently only `media-unavailable` (no SFU yet) |
+| `media-join` | C→S | empty — start audio (after the microphone is open); again later = replace the connection |
+| `offer` | S→C | `{type: "offer", sdp}`, `from: "sfu"`. **Only the server offers** |
+| `answer` | C→S | `{type: "answer", sdp}` |
+| `ice-candidate` | C↔S | `RTCIceCandidateInit` (`{candidate, sdpMid, sdpMLineIndex, usernameFragment}`); `null` = end of candidates |
+| `error` | S→C | `{code, message}`, codes below |
+
+Media messages (`media-join`, `offer`, `answer`, `ice-candidate`) must have
+`to` = `"sfu"` or empty (else `4400`).
+
+Error codes (`error` payload `code`):
+
+| Code | Meaning |
+|---|---|
+| `unexpected-offer` | a client sent an offer; the server makes all offers |
+| `unexpected-answer` | answer with no outstanding offer (e.g. before `media-join`) |
+| `media-failed` | the media connection failed, stayed `disconnected` > 15 s, or the answer was invalid; the server closed it. The client may send `media-join` again |
+| `media-unavailable` | only from the test stub `room.UnavailableMedia` (no SFU) |
 
 Unknown types, invalid JSON, a missing `type`, binary frames, a second `hello`
 or an invalid `peer-state` payload close the connection with `4400`.
@@ -168,13 +185,13 @@ Limits and liveness:
   closes that peer (`1008`) instead of stalling the room.
 - Graceful shutdown closes every socket with `1001` before the HTTP servers stop.
 
-Media side (step 3 plugs in here; `internal/room`):
+Media side (`internal/room`), implemented by `internal/sfu`:
 
 ```go
 type MediaHandler interface {
     PeerJoined(roomID, peerID string, send func(protocol.Envelope) error)
     PeerLeft(roomID, peerID string)
-    Signal(roomID, peerID string, msg protocol.Envelope) // offer / answer / ice-candidate
+    Signal(roomID, peerID string, msg protocol.Envelope) // media-join / offer / answer / ice-candidate
 }
 ```
 
@@ -183,11 +200,65 @@ removed, and never before `PeerJoined`. `Signal` gets the envelope with `from`
 set to the peer and `to = "sfu"`. `PeerJoined` and `Signal` run on the peer's
 reader goroutine, so they must return quickly (hand long work off). `send`
 never blocks (it queues; a full queue closes that peer asynchronously) and may
-be called from any goroutine. Until the SFU exists, a stub answers every media
-message with `error {code: "media-unavailable"}`.
+be called from any goroutine. `room.UnavailableMedia` is a stub for tests
+(answers every media message with `media-unavailable`).
 
-Clients implement *perfect negotiation* and are the polite side; the SFU
-renegotiates (server-initiated offers) when participants join or leave.
+## Media (SFU, `internal/sfu`)
+
+Pion WebRTC, one process-wide `webrtc.API`:
+
+- **Codec:** Opus only (48 kHz, 2 ch, `minptime=10;useinbandfec=1`); default
+  interceptors (NACK, RTCP reports, TWCC, stats).
+- **Transport:** one UDP socket on `MEDIA_PORT` shared by all connections (ICE
+  UDP mux). Every local address is rewritten to `ADVERTISE_IPS` (host
+  candidates). The socket only covers the advertised IP families (`udp4`,
+  `udp6` or dual-stack): the UDP mux publishes a candidate for every address
+  it listens on, and an address of an unadvertised family would otherwise leak
+  unchanged. mDNS off; no STUN/TURN on either side; ICE-TCP comes in step 5.
+
+**Model.** One `PeerConnection` per participant who sent `media-join`. Each
+publisher's incoming audio is forwarded (RTP only — no decoding, mixing or
+transcoding; header extensions stripped since their IDs are per connection)
+into a server-owned `TrackLocalStaticRTP` with stream ID = publisher `peerId`
+and track ID = `<peerId>-audio`. That track is added to every other
+participant's connection, so clients identify a speaker by stream ID. The
+logic is the same for 2 or N participants.
+
+**Negotiation — only the server sends offers** (no glare, no perfect
+negotiation on the client):
+
+1. The client opens the microphone, then sends `media-join`.
+2. The server creates the connection: transceiver 0 is for the client's
+   microphone (created `recvonly`; Pion may later reuse it to send another
+   participant's audio, which makes it `sendrecv`), plus one track per
+   existing publisher. It sends `offer`. The new publisher's track is added to
+   everyone else, who get a new offer too.
+3. The client applies the offer, puts its microphone on transceiver 0
+   (`sender.replaceTrack(mic)`, direction `sendrecv`), and sends `answer`.
+4. Trickle ICE both ways; `null` = end of candidates. Server candidates are
+   always sent after the offer that started gathering. Client candidates
+   arriving before the first answer are buffered.
+5. Any later change (someone joins media or leaves) → a new offer. Per
+   participant one offer is outstanding at a time: a change during an
+   outstanding offer sets a pending flag and the next offer goes out when the
+   answer arrives. Removed tracks free their transceiver for reuse, so the SDP
+   does not grow with churn.
+
+**Lifecycle.** WebSocket closed / `PeerLeft` → the connection is closed and
+the participant's track removed from the others (they are renegotiated). State
+`failed`, or `disconnected` for more than 15 s → closed with `media-failed`. A
+second `media-join` replaces the old connection.
+
+**Concurrency.** Each room has one worker goroutine that runs all Pion calls
+for that room in order; `MediaHandler` methods and Pion callbacks only enqueue
+work, so the signaling goroutine never blocks on Pion. Events carry the
+connection they belong to and are ignored if it has been replaced. Connections
+are closed off the worker (`GracefulClose`). Tests check for goroutine leaks
+(`goleak`).
+
+**Client** (`web/rtc.js`): `RTCPeerConnection({iceServers: []})`; incoming
+offers and candidates are applied strictly in order; each remote stream plays
+in its own `<audio autoplay playsinline>` keyed by stream ID.
 
 ## Security
 
@@ -208,6 +279,8 @@ port-80 bootstrap/redirect handlers, and a name-constrained CA in `selfca` mode.
   Certificate Trust Settings). Changing `SELFCA_PERMITTED` means a new CA and
   reinstalling it everywhere.
 - **Rooms are in memory:** a server restart ends all calls and invalidates links.
+- **No reconnection yet:** a dropped WebSocket ends the call for that client;
+  WS reconnect, ICE restart and ICE-TCP are step 5.
 
 ## Repository layout
 
@@ -221,7 +294,8 @@ internal/room/       room manager, MediaHandler interface + stub
 internal/api/        REST /api/rooms
 internal/signal/     WebSocket signaling
 internal/httpserver/ HTTPS handler, security headers, servers, graceful shutdown
-internal/sfu/        Pion SFU
-web/                 index.html, app.js, style.css, manifest.json, sw.js (go:embed)
+internal/sfu/        Pion SFU (implements room.MediaHandler)
+web/                 index.html, app.js (UI), rtc.js (signaling + WebRTC), style.css (go:embed)
+e2e/                 Playwright browser tests (Node; separate from the Go module)
 docs/                architecture, roadmap, agent prompts (executed ones in docs/executed/)
 ```

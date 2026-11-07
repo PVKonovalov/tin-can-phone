@@ -8,7 +8,7 @@ The prompt for the next step is written after the previous step is done.
 |---|---|---|---|
 | 1 | Skeleton: config, TLS modes `acme`/`files`/`selfca`, port-80 handlers, embedded static, `/healthz`, graceful shutdown | Placeholder page opens over HTTPS in `selfca` mode on LAN; tests green | done |
 | 2 | Rooms + WebSocket signaling: server-assigned peer IDs, envelope, TTL, `MAX_PEERS`, Origin check, rate limit, ping/pong | `httptest` tests with several WS clients: join/leave/notify/limits | done |
-| 3 | SFU, 1-on-1 audio: Pion, UDPMux on `MEDIA_PORT`, `ADVERTISE_IPS`; minimal UI (Create Call, Join Audio, Leave) | Playwright e2e: two Chromium instances with fake microphone receive each other's audio | — |
+| 3 | SFU, 1-on-1 audio: Pion, UDPMux on `MEDIA_PORT`, `ADVERTISE_IPS`; minimal UI (Create Call, Join Audio, Leave) | Playwright e2e: two Chromium instances with fake microphone receive each other's audio | done |
 | 4 | Multi-party: renegotiation on join/leave, mute, participant statuses, Copy Link | e2e with 4 participants; mute is visible to others | — |
 | 5 | Resilience: WS reconnect, ICE restart on network change, ICE-TCP fallback | e2e with UDP blocked still connects; reconnect after WS drop | — |
 | 6 | PWA + iOS: manifest, service worker (no caching of `/api`, `/ws`; network-first HTML), Media Session, limitation notes | Installable PWA; manual iOS/Android checklist passed | — |

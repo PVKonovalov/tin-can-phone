@@ -270,3 +270,55 @@ func TestRoomSettings(t *testing.T) {
 		t.Error("MAX_PEERS=33 accepted")
 	}
 }
+
+func TestMediaSettings(t *testing.T) {
+	base := map[string]string{"TLS_MODE": "files", "TLS_CERT": "c", "TLS_KEY": "k"}
+	with := func(kv ...string) map[string]string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	c, err := Load(env(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MediaPort != 50000 || len(c.AdvertiseIPs) != 0 {
+		t.Errorf("defaults %d %v", c.MediaPort, c.AdvertiseIPs)
+	}
+	c, err = Load(env(with("MEDIA_PORT", "40000", "ADVERTISE_IPS", "203.0.113.5, 192.168.1.10,2001:db8::1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MediaPort != 40000 || !slices.Equal(c.AdvertiseIPs, []string{"203.0.113.5", "192.168.1.10", "2001:db8::1"}) {
+		t.Errorf("got %d %v", c.MediaPort, c.AdvertiseIPs)
+	}
+
+	for _, tt := range []struct {
+		env  map[string]string
+		want []string
+	}{
+		{with("MEDIA_PORT", "0"), []string{"TINCAN_MEDIA_PORT: 0 out of range"}},
+		{with("MEDIA_PORT", "70000"), []string{"TINCAN_MEDIA_PORT: 70000 out of range"}},
+		{with("MEDIA_PORT", "x"), []string{"TINCAN_MEDIA_PORT"}},
+		{with("MEDIA_PORT", "443"), []string{"must differ from the HTTP(S) listen ports"}},
+		{with("MEDIA_PORT", "8080", "HTTP_ADDR", ":8080"), []string{"must differ"}},
+		{with("ADVERTISE_IPS", "10.0.0.1,host.lan,0.0.0.0,10.0.0.1,::0:1,::1,224.0.0.1"),
+			[]string{`"host.lan" is not an IP`, `"0.0.0.0" is not a unicast`, `"10.0.0.1" duplicates`, `"::1" duplicates "::0:1"`, `"224.0.0.1" is not a unicast`}},
+	} {
+		_, err := Load(env(tt.env))
+		if err == nil {
+			t.Errorf("%v: expected error", tt.env)
+			continue
+		}
+		for _, w := range tt.want {
+			if !strings.Contains(err.Error(), w) {
+				t.Errorf("error %q lacks %q", err, w)
+			}
+		}
+	}
+}

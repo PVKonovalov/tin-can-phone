@@ -8,7 +8,7 @@
 |---|---|---|---|
 | 1 | Каркас: конфиг, TLS-режимы `acme`/`files`/`selfca`, обработчики порта 80, встроенная статика, `/healthz`, graceful shutdown | Страница-заглушка открывается по HTTPS в режиме `selfca` в LAN; тесты зелёные | выполнено |
 | 2 | Комнаты + сигналинг по WebSocket: peerID от сервера, конверт, TTL, `MAX_PEERS`, проверка Origin, rate limit, ping/pong | Тесты на `httptest` с несколькими WS-клиентами: вход/выход/уведомления/лимиты | выполнено |
-| 3 | SFU, звонок 1-на-1: Pion, UDPMux на `MEDIA_PORT`, `ADVERTISE_IPS`; минимальный UI (Create Call, Join Audio, Leave) | e2e на Playwright: два Chromium с fake-микрофоном получают аудио друг друга | — |
+| 3 | SFU, звонок 1-на-1: Pion, UDPMux на `MEDIA_PORT`, `ADVERTISE_IPS`; минимальный UI (Create Call, Join Audio, Leave) | e2e на Playwright: два Chromium с fake-микрофоном получают аудио друг друга | выполнено |
 | 4 | Несколько участников: перепереговоры при входе/выходе, mute, статусы, Copy Link | e2e на 4 участника; mute виден остальным | — |
 | 5 | Устойчивость: переподключение WS, ICE restart при смене сети, запасной ICE-TCP | e2e с заблокированным UDP соединяется; восстановление после обрыва WS | — |
 | 6 | PWA + iOS: manifest, service worker (без кэша `/api`, `/ws`; HTML network-first), Media Session, описание ограничений | PWA устанавливается; ручной чек-лист iOS/Android пройден | — |
