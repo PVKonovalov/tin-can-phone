@@ -47,6 +47,10 @@ certificate once on each device, then open <a href="{{.HTTPSURL}}">{{.HTTPSURL}}
 </p>
 <p><b>{{.Subject}}</b><br>SHA-256 fingerprint:</p>
 <code class="fp">{{.Fingerprint}}</code>
+<p>This CA is name-constrained: it can only vouch for names under
+{{range $i, $d := .PermDNS}}{{if $i}}, {{end}}<code>{{$d}}</code>{{end}}
+and {{if .PermIPs}}addresses in {{range $i, $n := .PermIPs}}{{if $i}}, {{end}}<code>{{$n}}</code>{{end}}{{else}}no IP addresses{{end}}.
+Browsers reject anything else it signs.</p>
 <p class="warn">This page is served over plain HTTP. Before trusting the certificate,
 compare its fingerprint with the one in the server log or one given to you by the
 administrator. A trusted CA can vouch for any website, so install only a CA you expect.</p>
@@ -98,10 +102,10 @@ Install a certificate → <b>CA certificate</b> → Install anyway → pick the 
 
 // newInstallHandler serves the selfca port-80 endpoints and redirects
 // everything else to HTTPS.
-func newInstallHandler(ca *selfCA, httpsPort, httpPort string) http.Handler {
+func newInstallHandler(ca *selfCA, redirect http.Handler, httpsPort, publicURL string) http.Handler {
 	caPEM := ca.CACertPEM()
 	profile := mobileConfig(ca)
-	redirect := RedirectHandler(httpsPort)
+	permDNS, permIPs := ca.PermittedDescription()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -114,18 +118,20 @@ func newInstallHandler(ca *selfCA, httpsPort, httpPort string) http.Handler {
 		h.Set("Cache-Control", "no-store")
 		switch r.URL.Path {
 		case "/install":
-			host := hostOnly(r.Host)
-			if host == "" {
+			base, ok := httpsBase(r.Host, httpsPort, publicURL)
+			if !ok {
 				http.Error(w, "missing Host header", http.StatusBadRequest)
 				return
 			}
-			httpsURL := "https://" + withPort(host, httpsPort, "443") + "/"
+			httpsURL := "https://" + base + "/"
 			var buf bytes.Buffer
 			err := installTmpl.Execute(&buf, map[string]any{
 				"CSS":         template.CSS(installCSS),
 				"HTTPSURL":    httpsURL,
 				"Subject":     ca.caCert.Subject.CommonName,
 				"Fingerprint": ca.Fingerprint(),
+				"PermDNS":     permDNS,
+				"PermIPs":     permIPs,
 			})
 			if err != nil {
 				http.Error(w, "template error", http.StatusInternalServerError)

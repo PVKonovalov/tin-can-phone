@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/PVKonovalov/tin-can-phone/internal/config"
 )
 
 const (
@@ -43,11 +45,15 @@ const (
 )
 
 type selfCAOptions struct {
-	Dir      string
-	SANs     []string
-	Hostname string
-	Log      *slog.Logger
-	Now      func() time.Time // defaults to time.Now
+	Dir  string
+	SANs []string
+	// Permitted are the CA name constraints. SANs outside them are rejected
+	// by config validation; the implicit localhost/127.0.0.1 are added only
+	// when permitted.
+	Permitted config.Permitted
+	Hostname  string
+	Log       *slog.Logger
+	Now       func() time.Time // defaults to time.Now
 }
 
 // selfCA owns a local CA and the server certificate it signs.
@@ -82,7 +88,10 @@ func openSelfCA(opts selfCAOptions) (*selfCA, error) {
 	}
 
 	ca := &selfCA{opts: opts}
-	ca.dns, ca.ips = splitSANs(opts.SANs)
+	ca.dns, ca.ips = splitSANs(opts.SANs, opts.Permitted)
+	if len(ca.dns)+len(ca.ips) == 0 {
+		return nil, fmt.Errorf("selfca: no server certificate names: set %sSELFCA_SANS or permit localhost", config.Prefix)
+	}
 	if err := ca.loadOrCreateCA(); err != nil {
 		return nil, err
 	}
@@ -92,11 +101,17 @@ func openSelfCA(opts selfCAOptions) (*selfCA, error) {
 	return ca, nil
 }
 
-// splitSANs returns the de-duplicated DNS names and IPs, always including
-// localhost and 127.0.0.1. Both lists are sorted.
-func splitSANs(sans []string) ([]string, []net.IP) {
-	dnsSet := map[string]bool{alwaysDNSName: true}
-	ipSet := map[string]net.IP{alwaysIPAddress: net.ParseIP(alwaysIPAddress)}
+// splitSANs returns the de-duplicated DNS names and IPs, including localhost
+// and 127.0.0.1 when the name constraints permit them. Both lists are sorted.
+func splitSANs(sans []string, perm config.Permitted) ([]string, []net.IP) {
+	dnsSet := map[string]bool{}
+	ipSet := map[string]net.IP{}
+	if perm.Contains(alwaysDNSName) {
+		dnsSet[alwaysDNSName] = true
+	}
+	if perm.Contains(alwaysIPAddress) {
+		ipSet[alwaysIPAddress] = net.ParseIP(alwaysIPAddress)
+	}
 	for _, s := range sans {
 		if ip := net.ParseIP(s); ip != nil {
 			ipSet[ip.String()] = ip
@@ -134,6 +149,9 @@ func (ca *selfCA) loadOrCreateCA() error {
 		}
 		if !cert.IsCA {
 			return fmt.Errorf("selfca: %s is not a CA certificate", ca.path(caCertFile))
+		}
+		if err := ca.checkConstraints(cert); err != nil {
+			return err
 		}
 		if ca.opts.Now().After(cert.NotAfter) {
 			return fmt.Errorf("selfca: CA expired on %s; remove %s to create a new one (clients must reinstall it)", cert.NotAfter, ca.opts.Dir)
@@ -173,7 +191,9 @@ func (ca *selfCA) createCA() error {
 		IsCA:                  true,
 		MaxPathLen:            0,
 		MaxPathLenZero:        true,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
+	ca.applyConstraints(tmpl)
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, key.Public(), key)
 	if err != nil {
 		return fmt.Errorf("selfca: create CA: %w", err)
@@ -193,6 +213,96 @@ func (ca *selfCA) createCA() error {
 	ca.caCert, ca.caKey = cert, key
 	ca.opts.Log.Info("selfca: created new CA", "dir", ca.opts.Dir, "subject", cert.Subject.CommonName)
 	return nil
+}
+
+// applyConstraints sets the X.509 name constraints from opts.Permitted.
+// Constraints apply per name type, so without any CIDR all IPs are excluded.
+func (ca *selfCA) applyConstraints(tmpl *x509.Certificate) {
+	want := ca.wantConstraints()
+	tmpl.PermittedDNSDomainsCritical = true
+	tmpl.PermittedDNSDomains = want.dns
+	tmpl.PermittedIPRanges = want.permittedIPs
+	tmpl.ExcludedIPRanges = want.excludedIPs
+}
+
+type constraints struct {
+	dns          []string
+	permittedIPs []*net.IPNet
+	excludedIPs  []*net.IPNet
+	critical     bool
+	eku          []x509.ExtKeyUsage
+}
+
+func (c constraints) String() string {
+	return fmt.Sprintf("dns=%v permitted_ips=%v excluded_ips=%v critical=%v server_auth_eku=%v",
+		c.dns, netStrings(c.permittedIPs), netStrings(c.excludedIPs), c.critical,
+		slices.Equal(c.eku, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}))
+}
+
+func (c constraints) equal(o constraints) bool {
+	return slices.Equal(sortedCopy(c.dns), sortedCopy(o.dns)) &&
+		slices.Equal(sortedCopy(netStrings(c.permittedIPs)), sortedCopy(netStrings(o.permittedIPs))) &&
+		slices.Equal(sortedCopy(netStrings(c.excludedIPs)), sortedCopy(netStrings(o.excludedIPs))) &&
+		c.critical == o.critical && slices.Equal(c.eku, o.eku)
+}
+
+func (ca *selfCA) wantConstraints() constraints {
+	c := constraints{
+		dns:          slices.Clone(ca.opts.Permitted.DNS),
+		permittedIPs: slices.Clone(ca.opts.Permitted.Nets),
+		critical:     true,
+		eku:          []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	if len(c.permittedIPs) == 0 {
+		c.excludedIPs = []*net.IPNet{
+			{IP: net.IPv4zero.To4(), Mask: net.CIDRMask(0, 32)},
+			{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+		}
+	}
+	return c
+}
+
+func haveConstraints(cert *x509.Certificate) constraints {
+	return constraints{
+		dns:          cert.PermittedDNSDomains,
+		permittedIPs: cert.PermittedIPRanges,
+		excludedIPs:  cert.ExcludedIPRanges,
+		critical:     cert.PermittedDNSDomainsCritical,
+		eku:          cert.ExtKeyUsage,
+	}
+}
+
+// checkConstraints refuses an existing CA whose name constraints differ from
+// the configuration. A trusted CA is never replaced silently.
+func (ca *selfCA) checkConstraints(cert *x509.Certificate) error {
+	have, want := haveConstraints(cert), ca.wantConstraints()
+	if have.equal(want) {
+		return nil
+	}
+	return fmt.Errorf("selfca: the existing CA in %s has different name constraints than %sSELFCA_PERMITTED\n"+
+		"  CA has:      %s\n  config wants: %s\n"+
+		"The CA must be recreated: delete %s, restart, and reinstall the new CA on every device",
+		ca.opts.Dir, config.Prefix, have, want, ca.opts.Dir)
+}
+
+// PermittedDescription returns the permitted DNS suffixes and IP ranges.
+func (ca *selfCA) PermittedDescription() (dns, ips []string) {
+	c := haveConstraints(ca.caCert)
+	return c.dns, netStrings(c.permittedIPs)
+}
+
+func netStrings(ns []*net.IPNet) []string {
+	out := make([]string, len(ns))
+	for i, n := range ns {
+		out[i] = n.String()
+	}
+	return out
+}
+
+func sortedCopy(s []string) []string {
+	c := slices.Clone(s)
+	slices.Sort(c)
+	return c
 }
 
 // ensureServerCert loads the server certificate and re-issues it if it is
@@ -264,12 +374,12 @@ func (ca *selfCA) issueServerCert() error {
 		ca.opts.Log.Warn("selfca: CA expires soon; server certificate validity is limited by it",
 			"ca_not_after", ca.caCert.NotAfter)
 	}
+	// CN is informational (browsers use SANs): prefer a real DNS name.
 	cn := alwaysDNSName
-	for _, d := range ca.dns {
-		if d != alwaysDNSName {
-			cn = d
-			break
-		}
+	if i := slices.IndexFunc(ca.dns, func(d string) bool { return d != alwaysDNSName }); i >= 0 {
+		cn = ca.dns[i]
+	} else if len(ca.dns) == 0 && len(ca.ips) > 0 {
+		cn = ca.ips[0].String()
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber:          randomSerial(),

@@ -15,8 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PVKonovalov/tin-can-phone/internal/api"
 	"github.com/PVKonovalov/tin-can-phone/internal/config"
 	"github.com/PVKonovalov/tin-can-phone/internal/httpserver"
+	"github.com/PVKonovalov/tin-can-phone/internal/room"
+	"github.com/PVKonovalov/tin-can-phone/internal/signal"
 	"github.com/PVKonovalov/tin-can-phone/internal/tlsmode"
 	"github.com/PVKonovalov/tin-can-phone/web"
 )
@@ -24,12 +27,14 @@ import (
 type running struct {
 	httpsURL, httpURL string
 	client            *http.Client
+	roots             *x509.CertPool
 	cancel            context.CancelFunc
 	done              chan error
 }
 
 // start runs the full server (as cmd/tincan wires it) on 127.0.0.1:0.
-func start(t *testing.T, cfg *config.Config, roots *x509.CertPool) *running {
+// tweak may adjust the HTTPS http.Server before it starts.
+func start(t *testing.T, cfg *config.Config, roots *x509.CertPool, tweak ...func(*http.Server)) *running {
 	t.Helper()
 	httpsLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -40,6 +45,12 @@ func start(t *testing.T, cfg *config.Config, roots *x509.CertPool) *running {
 		t.Fatal(err)
 	}
 	cfg.HTTPSAddr, cfg.HTTPAddr = httpsLn.Addr().String(), httpLn.Addr().String()
+	if cfg.PublicHTTPPort == "" {
+		cfg.PublicHTTPPort = cfg.HTTPPort()
+	}
+	if cfg.MaxPeers == 0 {
+		cfg.MaxPeers, cfg.MaxRooms, cfg.RoomTTL = 8, 100, time.Hour
+	}
 
 	log := slog.New(slog.DiscardHandler)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -47,17 +58,26 @@ func start(t *testing.T, cfg *config.Config, roots *x509.CertPool) *running {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rooms := room.NewManager(room.Options{MaxPeers: cfg.MaxPeers, MaxRooms: cfg.MaxRooms, TTL: cfg.RoomTTL})
+	sig := signal.New(signal.Options{Rooms: rooms, AllowedOrigins: cfg.AllowedOrigins, Log: log})
 	h, err := httpserver.NewHandler(httpserver.Options{
 		Version: "test-1.2.3", Static: web.FS, HSTS: mode.HSTS, InstallURL: mode.InstallURL,
+		API: api.New(api.Options{Rooms: rooms, PublicURL: cfg.PublicURL}),
+		WS:  sig,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	httpsSrv := httpserver.NewServer(h, mode.TLSConfig, log)
+	for _, f := range tweak {
+		f(httpsSrv)
+	}
 	done := make(chan error, 1)
 	go func() {
 		done <- httpserver.Run(ctx, log,
-			httpserver.NewServer(h, mode.TLSConfig, log), httpsLn,
-			httpserver.NewServer(mode.HTTPHandler, nil, log), httpLn)
+			httpsSrv, httpsLn,
+			httpserver.NewServer(mode.HTTPHandler, nil, log), httpLn,
+			sig.Shutdown)
 	}()
 
 	if roots == nil {
@@ -76,6 +96,7 @@ func start(t *testing.T, cfg *config.Config, roots *x509.CertPool) *running {
 			Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
+		roots:  roots,
 		cancel: cancel,
 		done:   done,
 	}
@@ -110,8 +131,10 @@ func (r *running) get(t *testing.T, url string) (*http.Response, string) {
 	return resp, string(body)
 }
 
+var testPermitted = []string{"localhost", "127.0.0.0/8"}
+
 func selfCAConfig(t *testing.T) *config.Config {
-	return &config.Config{TLSMode: config.ModeSelfCA, SelfCADir: filepath.Join(t.TempDir(), "ca")}
+	return &config.Config{TLSMode: config.ModeSelfCA, SelfCADir: filepath.Join(t.TempDir(), "ca"), SelfCAPermitted: testPermitted}
 }
 
 func TestHTTPSHealthz(t *testing.T) {
@@ -154,7 +177,7 @@ func TestHTTPSIndexAndHeadersSelfCA(t *testing.T) {
 		}
 	}
 	wantHeaders := map[string]string{
-		"Content-Security-Policy": httpserver.ContentSecurityPolicy,
+		"Content-Security-Policy": httpserver.ContentSecurityPolicy + " wss://" + strings.TrimPrefix(s.httpsURL, "https://"),
 		"X-Content-Type-Options":  "nosniff",
 		"Referrer-Policy":         "no-referrer",
 		"Permissions-Policy":      "microphone=(self)",
@@ -215,7 +238,7 @@ func TestFilesModeHSTS(t *testing.T) {
 	// Mint a CA + server cert with selfca, then serve them in files mode.
 	caDir := filepath.Join(t.TempDir(), "ca")
 	ctx, cancel := context.WithCancel(context.Background())
-	if _, err := tlsmode.Setup(ctx, &config.Config{TLSMode: config.ModeSelfCA, SelfCADir: caDir}, slog.New(slog.DiscardHandler)); err != nil {
+	if _, err := tlsmode.Setup(ctx, &config.Config{TLSMode: config.ModeSelfCA, SelfCADir: caDir, SelfCAPermitted: testPermitted}, slog.New(slog.DiscardHandler)); err != nil {
 		t.Fatal(err)
 	}
 	cancel()

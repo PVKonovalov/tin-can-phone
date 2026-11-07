@@ -34,7 +34,11 @@ type Mode struct {
 // reloading in files mode, server certificate renewal in selfca mode) stops
 // when ctx is done.
 func Setup(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Mode, error) {
-	httpsPort, httpPort := cfg.HTTPSPort(), cfg.HTTPPort()
+	httpsPort, publicHTTPPort := cfg.HTTPSPort(), cfg.PublicHTTPPort
+	if publicHTTPPort == "" {
+		publicHTTPPort = config.DefaultPublicHTTP
+	}
+	redirect := RedirectHandler(httpsPort, cfg.PublicURL)
 	switch cfg.TLSMode {
 	case config.ModeFiles:
 		r, err := newFileReloader(cfg.TLSCert, cfg.TLSKey, log)
@@ -44,19 +48,24 @@ func Setup(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Mode, er
 		go r.watchSIGHUP(ctx)
 		tc := baseTLSConfig()
 		tc.GetCertificate = r.GetCertificate
-		return &Mode{TLSConfig: tc, HTTPHandler: RedirectHandler(httpsPort), HSTS: true}, nil
+		return &Mode{TLSConfig: tc, HTTPHandler: redirect, HSTS: true}, nil
 
 	case config.ModeACME:
-		tc, h := setupACME(cfg, httpsPort, log)
+		tc, h := setupACME(cfg, redirect, log)
 		return &Mode{TLSConfig: tc, HTTPHandler: h, HSTS: true}, nil
 
 	case config.ModeSelfCA:
+		perm, err := config.ParsePermitted(cfg.SelfCAPermitted)
+		if err != nil {
+			return nil, fmt.Errorf("selfca: %sSELFCA_PERMITTED: %w", config.Prefix, err)
+		}
 		hostname, _ := os.Hostname()
 		ca, err := openSelfCA(selfCAOptions{
-			Dir:      cfg.SelfCADir,
-			SANs:     cfg.SelfCASANs,
-			Hostname: hostname,
-			Log:      log,
+			Dir:       cfg.SelfCADir,
+			SANs:      cfg.SelfCASANs,
+			Permitted: perm,
+			Hostname:  hostname,
+			Log:       log,
 		})
 		if err != nil {
 			return nil, err
@@ -70,9 +79,9 @@ func Setup(ctx context.Context, cfg *config.Config, log *slog.Logger) (*Mode, er
 		tc.GetCertificate = ca.GetCertificate
 		return &Mode{
 			TLSConfig:   tc,
-			HTTPHandler: newInstallHandler(ca, httpsPort, httpPort),
+			HTTPHandler: newInstallHandler(ca, redirect, httpsPort, cfg.PublicURL),
 			HSTS:        false,
-			InstallURL:  func(r *http.Request) string { return InstallURL(r.Host, httpPort) },
+			InstallURL:  func(r *http.Request) string { return InstallURL(r.Host, publicHTTPPort) },
 		}, nil
 	}
 	return nil, fmt.Errorf("tlsmode: unknown mode %q", cfg.TLSMode)
@@ -82,11 +91,12 @@ func baseTLSConfig() *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS12}
 }
 
-// RedirectHandler redirects every request to the same host and path over
-// HTTPS (308, so the method and body are preserved).
-func RedirectHandler(httpsPort string) http.Handler {
+// RedirectHandler redirects every request to HTTPS with the same path and
+// query (308, so the method and body are preserved). If publicURL is set, its
+// host and port are used; otherwise the request host and httpsPort.
+func RedirectHandler(httpsPort, publicURL string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target, ok := httpsURL(r, httpsPort)
+		target, ok := httpsURL(r, httpsPort, publicURL)
 		if !ok {
 			http.Error(w, "missing Host header", http.StatusBadRequest)
 			return
@@ -95,19 +105,33 @@ func RedirectHandler(httpsPort string) http.Handler {
 	})
 }
 
-func httpsURL(r *http.Request, httpsPort string) (string, bool) {
-	host := hostOnly(r.Host)
-	if host == "" {
+func httpsURL(r *http.Request, httpsPort, publicURL string) (string, bool) {
+	base, ok := httpsBase(r.Host, httpsPort, publicURL)
+	if !ok {
 		return "", false
 	}
 	u := url.URL{
 		Scheme:   "https",
-		Host:     withPort(host, httpsPort, "443"),
+		Host:     base,
 		Path:     r.URL.Path,
 		RawPath:  r.URL.RawPath,
 		RawQuery: r.URL.RawQuery,
 	}
 	return u.String(), true
+}
+
+// httpsBase returns the host[:port] of the external HTTPS endpoint.
+func httpsBase(requestHost, httpsPort, publicURL string) (string, bool) {
+	if publicURL != "" {
+		if u, err := url.Parse(publicURL); err == nil && u.Host != "" {
+			return u.Host, true
+		}
+	}
+	host := hostOnly(requestHost)
+	if host == "" {
+		return "", false
+	}
+	return withPort(host, httpsPort, "443"), true
 }
 
 // InstallURL returns the plain-HTTP install page URL for requestHost.

@@ -10,7 +10,7 @@ import (
 	"github.com/PVKonovalov/tin-can-phone/internal/config"
 )
 
-func setupACME(cfg *config.Config, httpsPort string, log *slog.Logger) (*tls.Config, http.Handler) {
+func setupACME(cfg *config.Config, redirect http.Handler, log *slog.Logger) (*tls.Config, http.Handler) {
 	m := &autocert.Manager{
 		Prompt:     autocert.AcceptTOS,
 		Cache:      autocert.DirCache(cfg.ACMECacheDir),
@@ -23,5 +23,5 @@ func setupACME(cfg *config.Config, httpsPort string, log *slog.Logger) (*tls.Con
 	}
 	tc := m.TLSConfig() // includes the acme-tls/1 ALPN protocol for TLS-ALPN-01
 	tc.MinVersion = tls.VersionTLS12
-	return tc, m.HTTPHandler(RedirectHandler(httpsPort))
+	return tc, m.HTTPHandler(redirect)
 }

@@ -5,6 +5,8 @@ BIN     := bin/tincan
 # Extra SANs for the selfca server certificate (comma-separated DNS names / IPs).
 # Defaults to the primary LAN IP on macOS so phones on the same network can connect.
 SELFCA_SANS ?= $(shell ipconfig getifaddr en0 2>/dev/null)
+# Name constraints of the dev CA: loopback plus the private IPv4 ranges.
+SELFCA_PERMITTED ?= localhost,127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 
 .PHONY: build test run-selfca clean
 
@@ -21,6 +23,8 @@ run-selfca:
 	TINCAN_HTTP_ADDR=:8080 \
 	TINCAN_SELFCA_DIR=./.data/selfca \
 	TINCAN_SELFCA_SANS='$(SELFCA_SANS)' \
+	TINCAN_SELFCA_PERMITTED='$(SELFCA_PERMITTED)' \
+	TINCAN_PUBLIC_HTTP_PORT=8080 \
 	go run -ldflags '-X main.version=$(VERSION)' ./cmd/tincan
 
 clean:

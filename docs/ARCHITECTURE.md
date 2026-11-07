@@ -49,45 +49,153 @@ in both modes (except `localhost` during development).
 
 ## Configuration (environment, prefix `TINCAN_`)
 
-| Variable | Meaning |
+| Variable | Default | Meaning |
+|---|---|---|
+| `PUBLIC_URL` | | external base URL (`https://host[:port]`): room links, HTTP→HTTPS redirects, default `ALLOWED_ORIGINS` |
+| `PUBLIC_HTTP_PORT` | `80` | external plain-HTTP port, used for the `selfca` install link |
+| `HTTPS_ADDR`, `HTTP_ADDR` | `:443`, `:80` | listen addresses |
+| `TLS_MODE` | (required) | `acme` \| `files` \| `selfca` |
+| `TLS_CERT`, `TLS_KEY` | | for `files`; `SIGHUP` reloads them |
+| `ACME_DOMAINS`, `ACME_EMAIL`, `ACME_CACHE_DIR` | cache `.data/acme` | for `acme` |
+| `SELFCA_DIR` | `.data/selfca` | for `selfca`: where the CA and server certificate live |
+| `SELFCA_SANS` | | for `selfca`: DNS names and IPs of the server certificate; each must be inside `SELFCA_PERMITTED` |
+| `SELFCA_PERMITTED` | (required in `selfca`) | CA name constraints: DNS suffixes and CIDRs, e.g. `tincan.lan,localhost,10.0.0.0/8,127.0.0.0/8` |
+| `MAX_PEERS` | `8` | participants per room (2…32) |
+| `MAX_ROOMS` | `1000` | rooms in memory at once |
+| `ROOM_TTL` | `30m` | an empty room (including one never joined) is removed after this |
+| `ALLOWED_ORIGINS` | origin of `PUBLIC_URL` | WebSocket Origin allow-list, comma-separated; if neither is set, the Origin must be `https://` + the request `Host` |
+| `ADVERTISE_IPS` | | (step 3) IPs announced to clients as ICE candidates |
+| `MEDIA_PORT` | | (step 3) UDP/TCP media port |
+
+Invalid configuration is reported all at once at startup; the effective
+configuration is logged (it contains no secrets).
+
+## `selfca`: name-constrained local CA
+
+The CA root is installed and trusted on users' devices, so it must not be able
+to vouch for arbitrary sites if `ca.key` leaks. It carries critical X.509 name
+constraints built from `SELFCA_PERMITTED`:
+
+- DNS suffixes → `PermittedDNSDomains` (`tincan.lan` permits `tincan.lan` and
+  any `*.tincan.lan`). At least one is required (`localhost` counts).
+- CIDRs → `PermittedIPRanges`. Constraints apply per name type, so with no CIDR
+  the CA gets `ExcludedIPRanges` `0.0.0.0/0` and `::/0` (no IP certificates at all).
+- The CA itself has `ExtKeyUsage = serverAuth`, `MaxPathLen 0`.
+
+Constraints are a zone, not exact names: servers can be renamed inside the zone
+without a new CA. Changing `SELFCA_SANS` within the zone only re-issues the
+server certificate (also re-issued when < 30 days remain; validity 397 days).
+`localhost` and `127.0.0.1` are added to the server certificate when permitted.
+
+If an existing CA's constraints differ from `SELFCA_PERMITTED` (including an
+unconstrained CA from early dev builds), the server **refuses to start**: delete
+`SELFCA_DIR`, restart, and reinstall the new CA on every device. It is never
+replaced silently. The port-80 `/install` page shows the CA fingerprint and the
+permitted zone and ranges.
+
+## HTTP endpoints
+
+| Endpoint | |
 |---|---|
-| `PUBLIC_URL` | external base URL used to build room links (e.g. `https://call.example.com`) |
-| `HTTPS_ADDR`, `HTTP_ADDR` | listen addresses (default `:443`, `:80`) |
-| `TLS_MODE` | `acme` \| `files` \| `selfca` |
-| `TLS_CERT`, `TLS_KEY` | for `files` |
-| `ACME_DOMAINS`, `ACME_EMAIL`, `ACME_CACHE_DIR` | for `acme` |
-| `SELFCA_DIR`, `SELFCA_SANS` | for `selfca`: where CA/cert live; DNS names and IPs for the server cert |
-| `ADVERTISE_IPS` | IPs announced to clients as ICE candidates (public and/or LAN) |
-| `MEDIA_PORT` | UDP/TCP media port |
-| `MAX_PEERS` | participants per room |
-| `ROOM_TTL` | lifetime of an empty room |
-| `ALLOWED_ORIGINS` | WebSocket Origin allow-list (defaults to `PUBLIC_URL`) |
+| `GET /` , `GET /room/{id}` | `index.html` (the UI decides what to show; `/room/{id}` with a malformed id → 404) |
+| `GET /healthz` | `{"status":"ok","version":...}` |
+| `POST /api/rooms` | `201 {"roomId","url"}`; `url` from `PUBLIC_URL`, else `https://` + request `Host`. Rate limit per client IP: 10/min, burst 5 → `429` + `Retry-After`. `MAX_ROOMS` reached → `503` |
+| `GET /api/rooms/{id}` | `200 {"roomId","peers","maxPeers"}` or `404` |
+| `GET /ws?room={id}` | WebSocket signaling (below) |
 
-## Signaling protocol (WebSocket `/ws?room={roomID}`)
-
-JSON envelope: `{ "type": string, "from": string, "to": string, "payload": object }`.
-
-- The **server assigns `peerId`** and sends it in `welcome` (with the current
-  participant list). Clients never choose their own id.
-- The server always sets `from`; client-supplied `from` is ignored.
-- `peer-joined`, `peer-left`, `peer-state` (muted, display name) are produced by
-  the server only.
-- `offer` / `answer` / `ice-candidate` are exchanged between a client and the
-  SFU. When participants join or leave, the SFU renegotiates (server-initiated
-  offers). Clients implement *perfect negotiation* and are the polite side.
+API errors are JSON: `{"error": "<code>", "message": "..."}` (codes:
+`rate-limited`, `too-many-rooms`, `room-not-found`, `not-found`,
+`origin-not-allowed`, `shutting-down`). The client IP is the TCP peer address;
+proxy headers are not trusted.
 
 ## Rooms
 
-- `POST /api/rooms` → `{ roomId, url }`; room IDs carry ≥128 bits of randomness.
-- Joining a non-existent room fails with a clear error (no implicit creation).
-- Room is removed after `ROOM_TTL` without participants; `MAX_PEERS` enforced.
+- Room ID: 128 bits from `crypto/rand`, lowercase base32 without padding (26 chars).
+  Peer ID: 64 bits, same encoding (13 chars). The server assigns both.
+- Joining a non-existent room fails (no implicit creation); `MAX_PEERS` enforced.
+- A room is removed `ROOM_TTL` after it became empty (or after creation if
+  nobody joined). Occupied rooms never expire.
 - Anyone with the link can join (no authentication) — by design, for now.
+- In memory only; a restart drops all rooms.
+
+## Signaling protocol (WebSocket `/ws?room={roomId}`)
+
+JSON text frames only. Envelope: `{"type", "from", "to", "payload"}`.
+The server always sets `from` (`"server"` or the sender's `peerId`); a
+client-supplied `from` is ignored.
+
+Connection flow:
+
+1. The `Origin` header is checked before the upgrade (missing or not allowed → `403`).
+2. Unknown or malformed room ID → close `4404` right after the upgrade.
+3. The client must send `hello` within 5 s (otherwise `4400`); any other message
+   before `hello` → `4400`.
+4. The server assigns `peerId`, replies `welcome`, and sends `peer-joined` to
+   everyone else. Room full → `4409`.
+5. On disconnect for any reason the others get `peer-left`.
+
+| Type | Direction | Payload |
+|---|---|---|
+| `hello` | C→S | `{displayName}` — control and bidi-override characters stripped, trimmed, must be 1…40 runes (else `4400`) |
+| `welcome` | S→C | `{peerId, peers: [{peerId, displayName, muted}], maxPeers}` — `peers` are the others, in join order |
+| `peer-joined` | S→C | `{peerId, displayName, muted}` |
+| `peer-left` | S→C | `{peerId}` |
+| `peer-state` | C→S | `{muted: bool}` (required) |
+| `peer-state` | S→C | `{muted}` with `from` = that peer; sent to the others, not echoed |
+| `offer`, `answer`, `ice-candidate` | C↔S | passed to the media side; `to` must be `"sfu"` or empty (else `4400`) |
+| `error` | S→C | `{code, message}`; currently only `media-unavailable` (no SFU yet) |
+
+Unknown types, invalid JSON, a missing `type`, binary frames, a second `hello`
+or an invalid `peer-state` payload close the connection with `4400`.
+
+Close codes:
+
+| Code | Meaning |
+|---|---|
+| 1001 | server shutting down |
+| 1008 | peer too slow (outbound queue overflow, write timeout) or no pong in time |
+| 4400 | malformed or unknown message / message > 64 KiB / no `hello` in time |
+| 4404 | room not found |
+| 4409 | room full |
+| 4429 | message rate exceeded |
+
+Limits and liveness:
+
+- Max client message 64 KiB.
+- Per connection: 50 messages/s, burst 100 (every message counts, including `hello`).
+- Ping every 15 s; no pong within 10 s → close. Each write has a 5 s timeout.
+- Outbound queue of 64 messages per peer. Producers never block: a full queue
+  closes that peer (`1008`) instead of stalling the room.
+- Graceful shutdown closes every socket with `1001` before the HTTP servers stop.
+
+Media side (step 3 plugs in here; `internal/room`):
+
+```go
+type MediaHandler interface {
+    PeerJoined(roomID, peerID string, send func(protocol.Envelope) error)
+    PeerLeft(roomID, peerID string)
+    Signal(roomID, peerID string, msg protocol.Envelope) // offer / answer / ice-candidate
+}
+```
+
+`PeerJoined` is called once after `welcome`, `PeerLeft` once after the peer is
+removed, and never before `PeerJoined`. `Signal` gets the envelope with `from`
+set to the peer and `to = "sfu"`. `PeerJoined` and `Signal` run on the peer's
+reader goroutine, so they must return quickly (hand long work off). `send`
+never blocks (it queues; a full queue closes that peer asynchronously) and may
+be called from any goroutine. Until the SFU exists, a stub answers every media
+message with `error {code: "media-unavailable"}`.
+
+Clients implement *perfect negotiation* and are the polite side; the SFU
+renegotiates (server-initiated offers) when participants join or leave.
 
 ## Security
 
-WebSocket Origin check, rate limit on room creation, max message size, ping/pong
-keep-alive with timeouts, security headers (CSP without external sources), TLS only
-for everything except the port-80 bootstrap/redirect handlers.
+WebSocket Origin check, rate limits on room creation and on messages, max
+message size, ping/pong keep-alive, bounded per-peer queues, security headers
+(CSP `default-src 'self'` with `connect-src 'self' wss://<host>`, no external
+sources; HSTS except in `selfca` mode), TLS 1.2+ for everything except the
+port-80 bootstrap/redirect handlers, and a name-constrained CA in `selfca` mode.
 
 ## Known limitations (state them, don't hide them)
 
@@ -97,7 +205,9 @@ for everything except the port-80 bootstrap/redirect handlers.
   Media Session API does not prevent this.
 - **`selfca`:** the CA root must be installed and trusted on each device (on iOS:
   install the profile, then enable full trust in Settings → General → About →
-  Certificate Trust Settings).
+  Certificate Trust Settings). Changing `SELFCA_PERMITTED` means a new CA and
+  reinstalling it everywhere.
+- **Rooms are in memory:** a server restart ends all calls and invalidates links.
 
 ## Repository layout
 
@@ -105,8 +215,12 @@ for everything except the port-80 bootstrap/redirect handlers.
 cmd/tincan/          main: config, wiring, graceful shutdown
 internal/config/     env parsing + validation
 internal/tlsmode/    acme | files | selfca, port-80 handlers
-internal/room/       room manager
+internal/protocol/   signaling envelope, message types, close codes
+internal/ratelimit/  token buckets (per IP, per connection)
+internal/room/       room manager, MediaHandler interface + stub
+internal/api/        REST /api/rooms
 internal/signal/     WebSocket signaling
+internal/httpserver/ HTTPS handler, security headers, servers, graceful shutdown
 internal/sfu/        Pion SFU
 web/                 index.html, app.js, style.css, manifest.json, sw.js (go:embed)
 docs/                architecture, roadmap, agent prompts (executed ones in docs/executed/)

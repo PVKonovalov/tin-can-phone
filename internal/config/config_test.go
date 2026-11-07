@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func env(m map[string]string) func(string) string {
@@ -54,6 +55,7 @@ func TestLoadValid(t *testing.T) {
 			env: map[string]string{
 				"TLS_MODE": "selfca", "HTTPS_ADDR": "127.0.0.1:8443", "HTTP_ADDR": ":8080",
 				"SELFCA_DIR": "/tmp/ca", "SELFCA_SANS": "192.168.1.10,tincan.lan fd00::1",
+				"SELFCA_PERMITTED": "tincan.lan,localhost,192.168.0.0/16,fd00::/8",
 			},
 			check: func(t *testing.T, c *Config) {
 				if !slices.Equal(c.SelfCASANs, []string{"192.168.1.10", "tincan.lan", "fd00::1"}) {
@@ -66,7 +68,7 @@ func TestLoadValid(t *testing.T) {
 		},
 		{
 			name: "selfca defaults",
-			env:  map[string]string{"TLS_MODE": "selfca"},
+			env:  map[string]string{"TLS_MODE": "selfca", "SELFCA_PERMITTED": "localhost"},
 			check: func(t *testing.T, c *Config) {
 				if c.SelfCADir != DefaultSelfCADir || len(c.SelfCASANs) != 0 {
 					t.Errorf("got %q %v", c.SelfCADir, c.SelfCASANs)
@@ -151,8 +153,120 @@ func TestLoadInvalid(t *testing.T) {
 
 func TestIrrelevantSettingsIgnored(t *testing.T) {
 	// files-mode variables must not be required (or validated) in selfca mode and vice versa.
-	_, err := Load(env(map[string]string{"TLS_MODE": "selfca", "ACME_DOMAINS": "10.0.0.1"}))
+	_, err := Load(env(map[string]string{"TLS_MODE": "selfca", "SELFCA_PERMITTED": "localhost", "ACME_DOMAINS": "10.0.0.1"}))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSelfCAPermitted(t *testing.T) {
+	base := func(kv ...string) map[string]string {
+		m := map[string]string{"TLS_MODE": "selfca"}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return m
+	}
+	bad := []struct {
+		name string
+		env  map[string]string
+		want []string
+	}{
+		{"missing", base(), []string{"TINCAN_SELFCA_PERMITTED: required"}},
+		{"only cidrs", base("SELFCA_PERMITTED", "10.0.0.0/8"), []string{"at least one DNS suffix"}},
+		{"bad entries", base("SELFCA_PERMITTED", "localhost,10.0.0.0/33,10.1.1.1,bad_name"),
+			[]string{`"10.0.0.0/33"`, `"10.1.1.1" is an IP address`, `"bad_name"`}},
+		{"sans outside", base("SELFCA_PERMITTED", "tincan.lan,localhost,192.168.0.0/16",
+			"SELFCA_SANS", "a.tincan.lan,192.168.1.5,example.com,10.0.0.1,tincan.lan.evil.com"),
+			[]string{`"example.com", "10.0.0.1", "tincan.lan.evil.com" outside TINCAN_SELFCA_PERMITTED`}},
+	}
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(env(tt.env))
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			for _, w := range tt.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q lacks %q", err, w)
+				}
+			}
+			if strings.Contains(err.Error(), "a.tincan.lan") || strings.Contains(err.Error(), "192.168.1.5") {
+				t.Errorf("permitted SAN reported: %v", err)
+			}
+		})
+	}
+
+	c, err := Load(env(base("SELFCA_PERMITTED", "tincan.lan,localhost,127.0.0.0/8,::1/128", "SELFCA_SANS", "x.tincan.lan,127.0.0.2,::1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := ParsePermitted(c.SelfCAPermitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.DNS) != 2 || len(p.Nets) != 2 {
+		t.Errorf("parsed %+v", p)
+	}
+	for name, want := range map[string]bool{
+		"tincan.lan": true, "a.b.tincan.lan": true, "localhost": true, "TINCAN.LAN.": true,
+		"xtincan.lan": false, "tincan.lan.com": false, "127.1.2.3": true, "::1": true, "::2": false, "10.0.0.1": false,
+	} {
+		if got := p.Contains(name); got != want {
+			t.Errorf("Contains(%q)=%v want %v", name, got, want)
+		}
+	}
+}
+
+func TestRoomSettings(t *testing.T) {
+	c, err := Load(env(map[string]string{"TLS_MODE": "files", "TLS_CERT": "c", "TLS_KEY": "k"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxPeers != 8 || c.MaxRooms != 1000 || c.RoomTTL != 30*time.Minute || c.PublicHTTPPort != "80" || c.AllowedOrigins != nil {
+		t.Errorf("defaults: %+v", c)
+	}
+
+	c, err = Load(env(map[string]string{
+		"TLS_MODE": "files", "TLS_CERT": "c", "TLS_KEY": "k",
+		"MAX_PEERS": "32", "MAX_ROOMS": "5", "ROOM_TTL": "90s", "PUBLIC_HTTP_PORT": "8080",
+		"PUBLIC_URL": "https://Call.Example.com:443",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxPeers != 32 || c.MaxRooms != 5 || c.RoomTTL != 90*time.Second || c.PublicHTTPPort != "8080" {
+		t.Errorf("values: %+v", c)
+	}
+	if !slices.Equal(c.AllowedOrigins, []string{"https://call.example.com"}) {
+		t.Errorf("origins default from PUBLIC_URL: %v", c.AllowedOrigins)
+	}
+
+	c, err = Load(env(map[string]string{
+		"TLS_MODE": "files", "TLS_CERT": "c", "TLS_KEY": "k", "PUBLIC_URL": "https://a.example.com",
+		"ALLOWED_ORIGINS": "https://B.example.com:443, http://localhost:8080,https://[fd00::1]:8443",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"https://b.example.com", "http://localhost:8080", "https://[fd00::1]:8443"}; !slices.Equal(c.AllowedOrigins, want) {
+		t.Errorf("origins %v want %v", c.AllowedOrigins, want)
+	}
+
+	_, err = Load(env(map[string]string{
+		"TLS_MODE": "files", "TLS_CERT": "c", "TLS_KEY": "k",
+		"MAX_PEERS": "1", "MAX_ROOMS": "0", "ROOM_TTL": "soon", "PUBLIC_HTTP_PORT": "0",
+		"ALLOWED_ORIGINS": "https://ok.example.com,ftp://x,https://a.com/path",
+	}))
+	if err == nil {
+		t.Fatal("expected errors")
+	}
+	for _, w := range []string{"TINCAN_MAX_PEERS", "TINCAN_MAX_ROOMS", "TINCAN_ROOM_TTL", "TINCAN_PUBLIC_HTTP_PORT", `"ftp://x"`, `"https://a.com/path"`} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error lacks %s: %v", w, err)
+		}
+	}
+	if _, err := Load(env(map[string]string{"TLS_MODE": "files", "TLS_CERT": "c", "TLS_KEY": "k", "MAX_PEERS": "33"})); err == nil {
+		t.Error("MAX_PEERS=33 accepted")
 	}
 }

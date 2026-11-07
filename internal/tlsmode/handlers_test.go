@@ -20,7 +20,7 @@ import (
 
 func TestInstallHandlerCACert(t *testing.T) {
 	ca := newTestCA(t, t.TempDir(), nil, time.Now())
-	h := newInstallHandler(ca, "8443", "8080")
+	h := testInstallHandler(ca, "8443", "")
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://tincan.lan:8080/ca.crt", nil))
@@ -45,7 +45,7 @@ func TestInstallHandlerCACert(t *testing.T) {
 
 func TestInstallHandlerMobileConfig(t *testing.T) {
 	ca := newTestCA(t, t.TempDir(), nil, time.Now())
-	h := newInstallHandler(ca, "443", "80")
+	h := testInstallHandler(ca, "443", "")
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://tincan.lan/ca.mobileconfig", nil))
@@ -113,7 +113,7 @@ func TestInstallHandlerMobileConfig(t *testing.T) {
 
 func TestInstallHandlerPage(t *testing.T) {
 	ca := newTestCA(t, t.TempDir(), nil, time.Now())
-	h := newInstallHandler(ca, "8443", "8080")
+	h := testInstallHandler(ca, "8443", "")
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "http://192.168.1.10:8080/install", nil))
@@ -131,6 +131,7 @@ func TestInstallHandlerPage(t *testing.T) {
 	for _, want := range []string{
 		ca.Fingerprint(), "Android", "iPhone", "Windows", "macOS", "Linux",
 		`href="/ca.crt"`, `href="/ca.mobileconfig"`, "https://192.168.1.10:8443/",
+		"<code>tincan.lan</code>", "<code>localhost</code>", "<code>192.168.0.0/16</code>", "<code>127.0.0.0/8</code>",
 		"Certificate Trust Settings",
 	} {
 		if !strings.Contains(body, want) {
@@ -153,12 +154,16 @@ func TestRedirects(t *testing.T) {
 		url    string
 		want   string
 	}{
-		{"selfca path+query", newInstallHandler(ca, "8443", "8080"), "GET", "http://tincan.lan:8080/r/abc?x=1&y=%2F", "https://tincan.lan:8443/r/abc?x=1&y=%2F"},
-		{"selfca root", newInstallHandler(ca, "443", "80"), "GET", "http://tincan.lan/", "https://tincan.lan/"},
-		{"selfca POST to install", newInstallHandler(ca, "443", "80"), "POST", "http://tincan.lan/install", "https://tincan.lan/install"},
-		{"escaped path", RedirectHandler("443"), "GET", "http://example.com/a%2Fb/c?q", "https://example.com/a%2Fb/c?q"},
-		{"ipv6", RedirectHandler("8443"), "GET", "http://[fd00::1]:8080/x", "https://[fd00::1]:8443/x"},
-		{"ipv6 default port", RedirectHandler("443"), "GET", "http://[fd00::1]/x", "https://[fd00::1]/x"},
+		{"selfca path+query", testInstallHandler(ca, "8443", ""), "GET", "http://tincan.lan:8080/r/abc?x=1&y=%2F", "https://tincan.lan:8443/r/abc?x=1&y=%2F"},
+		{"selfca root", testInstallHandler(ca, "443", ""), "GET", "http://tincan.lan/", "https://tincan.lan/"},
+		{"selfca POST to install", testInstallHandler(ca, "443", ""), "POST", "http://tincan.lan/install", "https://tincan.lan/install"},
+		{"escaped path", RedirectHandler("443", ""), "GET", "http://example.com/a%2Fb/c?q", "https://example.com/a%2Fb/c?q"},
+		{"ipv6", RedirectHandler("8443", ""), "GET", "http://[fd00::1]:8080/x", "https://[fd00::1]:8443/x"},
+		{"ipv6 default port", RedirectHandler("443", ""), "GET", "http://[fd00::1]/x", "https://[fd00::1]/x"},
+		// Behind port forwarding: PUBLIC_URL host and port win over the listen port.
+		{"public url", RedirectHandler("8443", "https://call.example.com"), "GET", "http://10.0.0.5:8080/r/x?a=1", "https://call.example.com/r/x?a=1"},
+		{"public url with port", RedirectHandler("8443", "https://call.example.com:4443"), "GET", "http://call.example.com/p?q=%20", "https://call.example.com:4443/p?q=%20"},
+		{"selfca public url", testInstallHandler(ca, "8443", "https://tincan.lan"), "GET", "http://192.168.1.10:8080/x?y", "https://tincan.lan/x?y"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -171,6 +176,19 @@ func TestRedirects(t *testing.T) {
 				t.Errorf("Location %q, want %q", loc, tt.want)
 			}
 		})
+	}
+}
+
+func testInstallHandler(ca *selfCA, httpsPort, publicURL string) http.Handler {
+	return newInstallHandler(ca, RedirectHandler(httpsPort, publicURL), httpsPort, publicURL)
+}
+
+func TestInstallPageUsesPublicURL(t *testing.T) {
+	ca := newTestCA(t, t.TempDir(), nil, time.Now())
+	rec := httptest.NewRecorder()
+	testInstallHandler(ca, "8443", "https://tincan.lan:4443").ServeHTTP(rec, httptest.NewRequest("GET", "http://192.168.1.10:8080/install", nil))
+	if !strings.Contains(rec.Body.String(), "https://tincan.lan:4443/") {
+		t.Error("install page does not link to PUBLIC_URL")
 	}
 }
 

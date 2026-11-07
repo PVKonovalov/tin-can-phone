@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Prefix is prepended to every environment variable name.
@@ -30,11 +31,21 @@ const (
 	DefaultHTTPAddr     = ":80"
 	DefaultACMECacheDir = ".data/acme"
 	DefaultSelfCADir    = ".data/selfca"
+	DefaultPublicHTTP   = "80"
+	DefaultMaxPeers     = 8
+	DefaultMaxRooms     = 1000
+	DefaultRoomTTL      = 30 * time.Minute
+
+	MinMaxPeers = 2
+	MaxMaxPeers = 32
 )
 
 // Config is the effective server configuration.
 type Config struct {
 	PublicURL string // optional; external base URL (https://host[:port])
+	// PublicHTTPPort is the external plain-HTTP port used to build the selfca
+	// install link (default 80).
+	PublicHTTPPort string
 
 	HTTPSAddr string
 	HTTPAddr  string
@@ -53,6 +64,16 @@ type Config struct {
 	// selfca mode
 	SelfCADir  string
 	SelfCASANs []string // DNS names and IP literals, as configured (without implicit localhost/127.0.0.1)
+	// SelfCAPermitted are the CA name constraints: DNS suffixes and CIDRs.
+	SelfCAPermitted []string
+
+	// rooms and signaling
+	MaxPeers int
+	MaxRooms int
+	RoomTTL  time.Duration
+	// AllowedOrigins is the WebSocket Origin allow-list (normalized
+	// scheme://host[:port]). Empty means "same host as the request".
+	AllowedOrigins []string
 }
 
 // Load reads the configuration using getenv (normally os.Getenv) and validates
@@ -66,20 +87,60 @@ func Load(getenv func(string) string) (*Config, error) {
 		return v
 	}
 
-	c := &Config{
-		PublicURL:    strings.TrimRight(get("PUBLIC_URL"), "/"),
-		HTTPSAddr:    or(get("HTTPS_ADDR"), DefaultHTTPSAddr),
-		HTTPAddr:     or(get("HTTP_ADDR"), DefaultHTTPAddr),
-		TLSMode:      TLSMode(strings.ToLower(get("TLS_MODE"))),
-		TLSCert:      get("TLS_CERT"),
-		TLSKey:       get("TLS_KEY"),
-		ACMEDomains:  splitList(get("ACME_DOMAINS")),
-		ACMEEmail:    get("ACME_EMAIL"),
-		ACMECacheDir: or(get("ACME_CACHE_DIR"), DefaultACMECacheDir),
-		SelfCADir:    or(get("SELFCA_DIR"), DefaultSelfCADir),
-		SelfCASANs:   splitList(get("SELFCA_SANS")),
+	var errs []error
+	intVar := func(name string, def int) int {
+		v := get(name)
+		if v == "" {
+			return def
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s%s: %q is not an integer", Prefix, name, v))
+			return def
+		}
+		return n
 	}
-	if err := c.Validate(); err != nil {
+	durVar := func(name string, def time.Duration) time.Duration {
+		v := get(name)
+		if v == "" {
+			return def
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s%s: %q is not a duration (e.g. 30m, 1h)", Prefix, name, v))
+			return def
+		}
+		return d
+	}
+
+	c := &Config{
+		PublicURL:      strings.TrimRight(get("PUBLIC_URL"), "/"),
+		PublicHTTPPort: or(get("PUBLIC_HTTP_PORT"), DefaultPublicHTTP),
+		HTTPSAddr:      or(get("HTTPS_ADDR"), DefaultHTTPSAddr),
+		HTTPAddr:       or(get("HTTP_ADDR"), DefaultHTTPAddr),
+		TLSMode:        TLSMode(strings.ToLower(get("TLS_MODE"))),
+		TLSCert:        get("TLS_CERT"),
+		TLSKey:         get("TLS_KEY"),
+		ACMEDomains:    splitList(get("ACME_DOMAINS")),
+		ACMEEmail:      get("ACME_EMAIL"),
+		ACMECacheDir:   or(get("ACME_CACHE_DIR"), DefaultACMECacheDir),
+		SelfCADir:      or(get("SELFCA_DIR"), DefaultSelfCADir),
+		SelfCASANs:     splitList(get("SELFCA_SANS")),
+
+		SelfCAPermitted: splitList(get("SELFCA_PERMITTED")),
+		MaxPeers:        intVar("MAX_PEERS", DefaultMaxPeers),
+		MaxRooms:        intVar("MAX_ROOMS", DefaultMaxRooms),
+		RoomTTL:         durVar("ROOM_TTL", DefaultRoomTTL),
+	}
+	var originErrs []error
+	c.AllowedOrigins, originErrs = parseOrigins(splitListKeepCase(get("ALLOWED_ORIGINS")))
+	errs = append(errs, originErrs...)
+	if len(c.AllowedOrigins) == 0 && c.PublicURL != "" {
+		if o, err := NormalizeOrigin(c.PublicURL); err == nil {
+			c.AllowedOrigins = []string{o}
+		}
+	}
+	if err := errors.Join(append(errs, c.Validate())...); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -107,6 +168,20 @@ func (c *Config) Validate() error {
 	}
 	if err := validateAddr(c.HTTPAddr); err != nil {
 		add("%sHTTP_ADDR: %v", Prefix, err)
+	}
+	if c.PublicHTTPPort != "" {
+		if n, err := strconv.Atoi(c.PublicHTTPPort); err != nil || n < 1 || n > 65535 {
+			add("%sPUBLIC_HTTP_PORT: %q must be a port 1-65535", Prefix, c.PublicHTTPPort)
+		}
+	}
+	if c.MaxPeers < MinMaxPeers || c.MaxPeers > MaxMaxPeers {
+		add("%sMAX_PEERS: %d out of range %d-%d", Prefix, c.MaxPeers, MinMaxPeers, MaxMaxPeers)
+	}
+	if c.MaxRooms < 1 {
+		add("%sMAX_ROOMS: must be at least 1, got %d", Prefix, c.MaxRooms)
+	}
+	if c.RoomTTL < time.Second {
+		add("%sROOM_TTL: must be at least 1s, got %s", Prefix, c.RoomTTL)
 	}
 
 	switch c.TLSMode {
@@ -145,6 +220,23 @@ func (c *Config) Validate() error {
 				add("%sSELFCA_SANS: %q is neither an IP address nor a valid DNS name", Prefix, s)
 			}
 		}
+		perm, err := ParsePermitted(c.SelfCAPermitted)
+		switch {
+		case len(c.SelfCAPermitted) == 0:
+			add("%sSELFCA_PERMITTED: required when %sTLS_MODE=selfca (DNS suffixes and CIDRs, e.g. tincan.lan,localhost,192.168.0.0/16,127.0.0.0/8)", Prefix, Prefix)
+		case err != nil:
+			add("%sSELFCA_PERMITTED: %v", Prefix, err)
+		default:
+			var outside []string
+			for _, s := range c.SelfCASANs {
+				if (net.ParseIP(s) != nil || validDNSName(s)) && !perm.Contains(s) {
+					outside = append(outside, s)
+				}
+			}
+			if len(outside) > 0 {
+				add("%sSELFCA_SANS: %s outside %sSELFCA_PERMITTED %v", Prefix, strings.Join(quoteAll(outside), ", "), Prefix, c.SelfCAPermitted)
+			}
+		}
 	case "":
 		add("%sTLS_MODE: required (acme | files | selfca)", Prefix)
 	default:
@@ -169,6 +261,10 @@ func (c *Config) LogAttrs() []any {
 		slog.String("https_addr", c.HTTPSAddr),
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("public_url", c.PublicURL),
+		slog.Int("max_peers", c.MaxPeers),
+		slog.Int("max_rooms", c.MaxRooms),
+		slog.Duration("room_ttl", c.RoomTTL),
+		slog.Any("allowed_origins", c.AllowedOrigins),
 	}
 	switch c.TLSMode {
 	case ModeFiles:
@@ -181,7 +277,9 @@ func (c *Config) LogAttrs() []any {
 	case ModeSelfCA:
 		attrs = append(attrs,
 			slog.String("selfca_dir", c.SelfCADir),
-			slog.Any("selfca_sans", c.SelfCASANs))
+			slog.Any("selfca_sans", c.SelfCASANs),
+			slog.Any("selfca_permitted", c.SelfCAPermitted),
+			slog.String("public_http_port", c.PublicHTTPPort))
 	}
 	return attrs
 }
@@ -197,6 +295,108 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+func splitListKeepCase(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == ';' })
+}
+
+func quoteAll(ss []string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = strconv.Quote(s)
+	}
+	return out
+}
+
+func parseOrigins(list []string) ([]string, []error) {
+	var out []string
+	var errs []error
+	for _, o := range list {
+		n, err := NormalizeOrigin(o)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%sALLOWED_ORIGINS: %v", Prefix, err))
+			continue
+		}
+		out = append(out, n)
+	}
+	return out, errs
+}
+
+// NormalizeOrigin returns origin as lower-case scheme://host[:port], without
+// the default port for the scheme. Only http and https are accepted.
+func NormalizeOrigin(origin string) (string, error) {
+	u, err := url.Parse(strings.TrimRight(origin, "/"))
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
+		return "", fmt.Errorf("%q is not an origin (want scheme://host[:port])", origin)
+	}
+	scheme, host, port := strings.ToLower(u.Scheme), strings.ToLower(u.Hostname()), u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host, nil
+}
+
+// Permitted is a parsed selfca name-constraint set.
+type Permitted struct {
+	DNS  []string     // DNS suffixes (a name matches if equal to or a subdomain of an entry)
+	Nets []*net.IPNet // permitted IP ranges
+}
+
+// ParsePermitted parses DNS suffixes and CIDRs. At least one DNS suffix is
+// required.
+func ParsePermitted(list []string) (Permitted, error) {
+	var p Permitted
+	var errs []error
+	for _, e := range list {
+		if strings.Contains(e, "/") {
+			_, n, err := net.ParseCIDR(e)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%q is not a valid CIDR", e))
+				continue
+			}
+			p.Nets = append(p.Nets, n)
+			continue
+		}
+		if net.ParseIP(e) != nil {
+			errs = append(errs, fmt.Errorf("%q is an IP address; use a CIDR such as %s/32", e, e))
+			continue
+		}
+		if !validDNSName(e) {
+			errs = append(errs, fmt.Errorf("%q is neither a CIDR nor a valid DNS suffix", e))
+			continue
+		}
+		p.DNS = append(p.DNS, e)
+	}
+	if len(p.DNS) == 0 && len(errs) == 0 {
+		errs = append(errs, errors.New("at least one DNS suffix is required (localhost counts)"))
+	}
+	return p, errors.Join(errs...)
+}
+
+// Contains reports whether name (a DNS name or IP literal) is permitted.
+func (p Permitted) Contains(name string) bool {
+	if ip := net.ParseIP(name); ip != nil {
+		for _, n := range p.Nets {
+			if n.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	for _, d := range p.DNS {
+		if name == d || strings.HasSuffix(name, "."+d) {
+			return true
+		}
+	}
+	return false
 }
 
 func validateAddr(addr string) error {

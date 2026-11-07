@@ -9,12 +9,25 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/PVKonovalov/tin-can-phone/internal/config"
 )
+
+var defaultPermitted = []string{"tincan.lan", "a.lan", "b.lan", "localhost", "127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "fd00::/8"}
+
+func testPermitted(t *testing.T, list ...string) config.Permitted {
+	t.Helper()
+	p, err := config.ParsePermitted(list)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
 
 func newTestCA(t *testing.T, dir string, sans []string, now time.Time) *selfCA {
 	t.Helper()
 	ca, err := openSelfCA(selfCAOptions{
-		Dir: dir, SANs: sans, Hostname: "testhost",
+		Dir: dir, SANs: sans, Hostname: "testhost", Permitted: testPermitted(t, defaultPermitted...),
 		Now: func() time.Time { return now },
 	})
 	if err != nil {
@@ -195,7 +208,7 @@ func TestSelfCARefusesCertWithoutKey(t *testing.T) {
 	if err := os.Remove(filepath.Join(dir, caKeyFile)); err != nil {
 		t.Fatal(err)
 	}
-	_, err := openSelfCA(selfCAOptions{Dir: dir})
+	_, err := openSelfCA(selfCAOptions{Dir: dir, Permitted: testPermitted(t, defaultPermitted...)})
 	if err == nil {
 		t.Fatal("expected error when CA key is missing")
 	}

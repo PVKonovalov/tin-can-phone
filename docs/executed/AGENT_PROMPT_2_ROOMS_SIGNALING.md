@@ -4,7 +4,7 @@
 
 Read `docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and `docs/executed/AGENT_PROMPT_1_SKELETON.md`.
 Step 1 (skeleton, TLS modes) is done. This step adds rooms and the signaling
-channel. **No WebRTC yet** — the SFU arrives in step 3 and must plug into what you
+channel, plus two small `selfca`/URL fixes (sections 0 and 0b). **No WebRTC yet** — the SFU arrives in step 3 and must plug into what you
 build here without reworking it.
 
 Same hard rule: no external infrastructure at runtime.
@@ -19,6 +19,49 @@ forwarding (e.g. external 443 → internal 8443) they point to the wrong port.
 - New optional `TINCAN_PUBLIC_HTTP_PORT` (default `80`) — external plain-HTTP
   port used to build the `selfca` install link.
 - Tests for both cases.
+
+## 0b. `selfca`: name-constrained CA
+
+A CA root installed and trusted on users' devices must not be able to vouch for
+arbitrary sites if `ca.key` leaks. Restrict it with X.509 name constraints to a
+zone and address ranges (not to exact names, so renaming servers inside the zone
+does not need a new CA).
+
+- New variable `TINCAN_SELFCA_PERMITTED` — comma-separated DNS suffixes and
+  CIDRs, e.g. `tincan.lan,localhost,10.0.0.0/8,127.0.0.0/8`. **Required in
+  `selfca` mode.** `make run-selfca` sets a sensible dev value
+  (`localhost,127.0.0.0/8,::1/128` plus the private ranges `10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`).
+- CA certificate:
+  - `PermittedDNSDomains` from the DNS entries, `PermittedIPRanges` from the CIDRs,
+    `PermittedDNSDomainsCritical = true`;
+  - constraints apply per name type, so if no CIDR is given, set
+    `ExcludedIPRanges` to `0.0.0.0/0` and `::/0`; at least one DNS suffix is
+    required (`localhost` counts);
+  - `ExtKeyUsage = [serverAuth]` on the CA as well.
+- Validation at startup: every entry of `SELFCA_SANS` must lie inside the
+  permitted set, otherwise a config error that names the offending entries.
+- Existing CA whose constraints differ from the config (including the
+  unconstrained CA from step 1 dev runs): **refuse to start** with a message that
+  the CA must be recreated (delete `SELFCA_DIR`) and reinstalled on every device.
+  Never replace it silently. Changing only `SELFCA_SANS` within the permitted set
+  still just re-issues the server certificate.
+- `/install` page shows the permitted zone and ranges next to the fingerprint.
+- Document in `ARCHITECTURE.md` (config table and the `selfca` section).
+
+Tests:
+
+- Chain verifies with `x509.Verify` for every SAN inside the constraints.
+- A leaf signed by the same CA for `example.com` and for `8.8.8.8` fails
+  verification (sign it in the test directly with the CA key).
+- No CIDR configured → a leaf with any IP SAN fails.
+- SAN outside the permitted set → config error.
+- Existing CA with different (or no) constraints → startup refusal; same
+  constraints → reused.
+
+Done-when addition: after reinstalling the new CA, the LAN page opens without
+warnings on an iPhone and an Android phone (both platforms honour name
+constraints; record the result in the completion notes).
 
 ## 1. Configuration
 
